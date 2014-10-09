@@ -38,10 +38,10 @@ if exist "%FWDIR%conf\spark-env.cmd" call "%FWDIR%conf\spark-env.cmd"
 rem Build up classpath
 set CLASSPATH=%SPARK_CLASSPATH%;%SPARK_SUBMIT_CLASSPATH%
 
-if "x%SPARK_CONF_DIR%"!="x" (
-  set CLASSPATH=%CLASSPATH%;%SPARK_CONF_DIR%
-) else (
+if "x%SPARK_CONF_DIR%"=="x" (
   set CLASSPATH=%CLASSPATH%;%FWDIR%conf
+) else (
+  set CLASSPATH=%CLASSPATH%;%SPARK_CONF_DIR%
 )
 
 if exist "%FWDIR%RELEASE" (
