@@ -18,7 +18,9 @@
 package org.apache.spark.sql.catalyst.expressions
 
 import org.apache.spark.sql.catalyst.ScalaReflection
-import org.apache.spark.sql.types.DataType
+import org.apache.spark.sql.types.{DataType, UdafFunction}
+
+import scala.reflect.runtime.universe.TypeTag
 
 /**
  * User-defined function.
@@ -399,3 +401,76 @@ case class ScalaUdf(function: AnyRef, dataType: DataType, children: Seq[Expressi
     ScalaReflection.convertToCatalyst(result, dataType)
   }
 }
+
+case class ScalaCombineUdaf(udafFunction:AnyRef, dataType: DataType, partialExpression: Expression)
+  extends AggregateExpression {
+  
+  def this() = this(null, null, null) // Required for serialization.
+  
+  type EvaluatedType = Any
+
+  def nullable = true
+
+  override def children = partialExpression :: Nil 
+    
+  override def toString = s"scalaUDAF(${children.mkString(",")})"
+
+  def newInstance() = new ScalaCombineUdafFunction(udafFunction.asInstanceOf[UdafFunction[Any, Any]].makeCopy(),partialExpression,this);
+}
+
+case class ScalaPartialUdaf(udafFunction:AnyRef, dataType: DataType, children: Seq[Expression])
+  extends PartialAggregate {
+  def this() = this(null, null, null) // Required for serialization.
+  override def nullable = false
+  override def toString = s"(ScalaPartialUDAF ${children.mkString(",")})"
+  override def newInstance() = 
+    new ScalaPartialUdafFunction(udafFunction.asInstanceOf[UdafFunction[Any, Any]].makeCopy(),children,this);
+
+  override def asPartial = {
+    val partialResult = Alias(ScalaPartialUdaf(udafFunction, dataType, children), "partialUdafRes")()
+    SplitEvaluation(
+      ScalaCombineUdaf(udafFunction, dataType, partialResult.toAttribute), partialResult :: Nil)
+  }
+}
+
+case class ScalaCombineUdafFunction(
+  udafFunction: AnyRef, 
+  paritialExpression: Expression, 
+  base: AggregateExpression)
+  extends AggregateFunction {
+
+  def this() = this(null, null, null) // Required for serialization.
+
+  override def eval(input: Row): Any = ScalaReflection.convertToCatalyst(
+      udafFunction.asInstanceOf[UdafFunction[Any, Any]].eval, base.dataType)
+
+  def update(input: Row): Unit = {
+    val partialResult = paritialExpression.eval(input)
+    udafFunction.asInstanceOf[UdafFunction[Any, Any]].merge(Seq(partialResult))
+  }
+}
+
+case class ScalaPartialUdafFunction(
+  udafFunction: AnyRef,
+  expr: Seq[Expression],
+  base: AggregateExpression)
+  extends AggregateFunction {
+
+  def this() = this(null, null, null) // Required for serialization.
+  
+  override def eval(input: Row): Any = udafFunction.asInstanceOf[UdafFunction[Any, Any]].partialEval
+
+  def update(input: Row): Unit = {
+    val result = expr.size match {
+      case 0 => udafFunction.asInstanceOf[UdafFunction[Any, Any]].update.asInstanceOf[() => Any]()
+      case 1 => udafFunction.asInstanceOf[UdafFunction[Any, Any]].update.asInstanceOf[(Any) => Any](
+          ScalaReflection.convertToScala(expr(0).eval(input), expr(0).dataType))
+      case 2 =>
+        udafFunction.asInstanceOf[UdafFunction[Any, Any]].update.asInstanceOf[(Any, Any) => Any](
+          ScalaReflection.convertToScala(expr(0).eval(input), expr(0).dataType),
+          ScalaReflection.convertToScala(expr(0).eval(input), expr(0).dataType))
+    }
+  }
+}
+
+//

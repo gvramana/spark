@@ -19,16 +19,16 @@ package org.apache.spark.sql
 
 import java.util.{List => JList, Map => JMap}
 
-import scala.reflect.runtime.universe.TypeTag
+import scala.reflect.runtime.universe.{TypeTag, typeTag}
 
 import org.apache.spark.{Accumulator, Logging}
 import org.apache.spark.api.python.PythonBroadcast
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.sql.api.java._
 import org.apache.spark.sql.catalyst.ScalaReflection
-import org.apache.spark.sql.catalyst.expressions.{Expression, ScalaUdf}
+import org.apache.spark.sql.catalyst.expressions.{Expression, ScalaUdf, ScalaPartialUdaf}
 import org.apache.spark.sql.execution.PythonUDF
-import org.apache.spark.sql.types.DataType
+import org.apache.spark.sql.types.{DataType, UdafFunction}
 
 
 /**
@@ -566,6 +566,22 @@ class UDFRegistration(sqlContext: SQLContext) extends Logging {
       name,
       (e: Seq[Expression]) => ScalaUdf(f.asInstanceOf[UDF22[Any, Any, Any, Any, Any, Any, Any, Any, Any, Any, Any, Any, Any, Any, Any, Any, Any, Any, Any, Any, Any, Any, Any]].call(_: Any, _: Any, _: Any, _: Any, _: Any, _: Any, _: Any, _: Any, _: Any, _: Any, _: Any, _: Any, _: Any, _: Any, _: Any, _: Any, _: Any, _: Any, _: Any, _: Any, _: Any, _: Any), returnType, e))
   }
+  
+  /**
+   * Register a user-defined aggregate function.
+   * @param name: Name of the aggregate function
+   * @param udafFunction: user defined aggregate function 
+   */
+  def registerAggregate[R: TypeTag, PR: TypeTag](
+    name: String,
+    udafFunction: UdafFunction[R, PR]): Unit = {
+
+    def builder(e: Seq[Expression]) =
+      ScalaPartialUdaf(udafFunction, ScalaReflection.schemaFor(typeTag[R]).dataType, e)
+    functionRegistry.registerFunction(name, builder)
+  }
 
   // scalastyle:on
 }
+
+
