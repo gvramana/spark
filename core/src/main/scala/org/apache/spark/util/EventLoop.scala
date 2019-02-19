@@ -17,7 +17,7 @@
 
 package org.apache.spark.util
 
-import java.util.concurrent.{BlockingQueue, LinkedBlockingDeque}
+import java.util.concurrent.{ArrayBlockingQueue, BlockingQueue, LinkedBlockingDeque}
 import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.util.control.NonFatal
@@ -33,7 +33,7 @@ import org.apache.spark.internal.Logging
  */
 private[spark] abstract class EventLoop[E](name: String) extends Logging {
 
-  private val eventQueue: BlockingQueue[E] = new LinkedBlockingDeque[E]()
+  private val eventQueue: BlockingQueue[E] = new ArrayBlockingQueue[E](100)
 
   private val stopped = new AtomicBoolean(false)
 

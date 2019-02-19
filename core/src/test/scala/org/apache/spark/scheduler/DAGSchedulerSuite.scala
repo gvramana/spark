@@ -532,7 +532,7 @@ class DAGSchedulerSuite extends SparkFunSuite with LocalSparkContext with TimeLi
       Seq(makeBlockManagerId("hostB"), makeBlockManagerId("hostC"))
     cacheLocations(rdd.id -> 2) =
       Seq(makeBlockManagerId("hostC"), makeBlockManagerId("hostD"))
-    val locs = scheduler.getCacheLocs(rdd).map(_.map(_.host))
+    val locs = scheduler.getCacheLocs(rdd).map(_.map(_.map(_.host))).get
     assert(locs === Seq(Seq("hostA", "hostB"), Seq("hostB", "hostC"), Seq("hostC", "hostD")))
   }
 

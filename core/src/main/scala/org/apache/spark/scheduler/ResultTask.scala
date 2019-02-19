@@ -23,8 +23,9 @@ import java.nio.ByteBuffer
 import java.util.Properties
 
 import org.apache.spark._
-import org.apache.spark.broadcast.Broadcast
+import org.apache.spark.broadcast.{Broadcast, DummyBroadCast}
 import org.apache.spark.rdd.RDD
+import org.apache.spark.rdd.util.{DirectOneRDD, DirectRDD}
 
 /**
  * A task that sends back the output to the driver application.
@@ -70,6 +71,15 @@ private[spark] class ResultTask[T, U](
   }
 
   override def runTask(context: TaskContext): U = {
+    val out = if(taskBinary.isInstanceOf[DummyBroadCast[_]]) {
+      directRunTask(context)
+    } else {
+      deserializeAndRunTask(context)
+    }
+    out
+  }
+
+  private def deserializeAndRunTask(context: TaskContext): U = {
     // Deserialize the RDD and the func using the broadcast variables.
     val threadMXBean = ManagementFactory.getThreadMXBean
     val deserializeStartTime = System.currentTimeMillis()
@@ -78,7 +88,8 @@ private[spark] class ResultTask[T, U](
     } else 0L
     val ser = SparkEnv.get.closureSerializer.newInstance()
     val (rdd, func) = ser.deserialize[(RDD[T], (TaskContext, Iterator[T]) => U)](
-      ByteBuffer.wrap(taskBinary.value), Thread.currentThread.getContextClassLoader)
+      ByteBuffer.wrap(taskBinary.asInstanceOf[Broadcast[Array[Byte]]].value),
+      Thread.currentThread.getContextClassLoader)
     _executorDeserializeTime = System.currentTimeMillis() - deserializeStartTime
     _executorDeserializeCpuTime = if (threadMXBean.isCurrentThreadCpuTimeSupported) {
       threadMXBean.getCurrentThreadCpuTime - deserializeStartCpuTime
@@ -87,6 +98,38 @@ private[spark] class ResultTask[T, U](
     func(context, rdd.iterator(partition, context))
   }
 
+  private def directRunTask(context: TaskContext): U = {
+    // Deserialize the RDD and the func using the broadcast variables.
+    val threadMXBean = ManagementFactory.getThreadMXBean
+    val deserializeStartTime = System.currentTimeMillis()
+    val deserializeStartCpuTime = if (threadMXBean.isCurrentThreadCpuTimeSupported) {
+      threadMXBean.getCurrentThreadCpuTime
+    } else 0L
+    val ser = SparkEnv.get.closureSerializer.newInstance()
+    val rdd = ser.deserialize[(DirectRDD[T])](
+      ByteBuffer.wrap(taskBinary.asInstanceOf[Broadcast[Array[Byte]]].value),
+      Thread.currentThread.getContextClassLoader)
+    _executorDeserializeTime = System.currentTimeMillis() - deserializeStartTime
+    _executorDeserializeCpuTime = if (threadMXBean.isCurrentThreadCpuTimeSupported) {
+      threadMXBean.getCurrentThreadCpuTime - deserializeStartCpuTime
+    } else 0L
+    val func = rdd.getFunc(false)
+    func(context, rdd.iterator(partition, context)).asInstanceOf[U]
+    //rdd.iterator(partition, context).asInstanceOf[U]
+  }
+
+//  private def directRunTask(context: TaskContext): U = {
+//    val loader = Thread.currentThread.getContextClassLoader
+//    val classInstance = loader.loadClass("org.apache.spark.scheduler.CustomDirectOneRDD")
+//    classInstance.co
+////    val rdd = taskBinary.asInstanceOf[Broadcast[RDD[T]]].value
+////    //val func = (taskContext: TaskContext, iter: Iterator[T]) => iter.toArray
+////    _executorDeserializeTime = 0
+////    _executorDeserializeCpuTime = 0L
+////
+////    //func.asInstanceOf[(TaskContext, Iterator[T]) => U](context, rdd.iterator(partition, context))
+////    rdd.iterator(partition, context).toArray.asInstanceOf[U]
+//  }
   // This is only callable on the driver side.
   override def preferredLocations: Seq[TaskLocation] = preferredLocs
 

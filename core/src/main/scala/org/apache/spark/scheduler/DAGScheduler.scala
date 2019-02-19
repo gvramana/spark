@@ -23,7 +23,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 import scala.annotation.tailrec
-import scala.collection.Map
+import scala.collection.{Map, mutable}
 import scala.collection.mutable.{ArrayStack, HashMap, HashSet}
 import scala.concurrent.duration._
 import scala.language.existentials
@@ -31,14 +31,14 @@ import scala.language.postfixOps
 import scala.util.control.NonFatal
 
 import org.apache.commons.lang3.SerializationUtils
-
 import org.apache.spark._
-import org.apache.spark.broadcast.Broadcast
+import org.apache.spark.broadcast.{Broadcast, DummyBroadCast}
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config
 import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.partial.{ApproximateActionListener, ApproximateEvaluator, PartialResult}
+import org.apache.spark.rdd.util.{DirectOneRDD, DirectRDD}
 import org.apache.spark.rdd.{RDD, RDDCheckpointData}
 import org.apache.spark.rpc.RpcTimeout
 import org.apache.spark.storage._
@@ -289,7 +289,11 @@ class DAGScheduler(
   }
 
   private[scheduler]
-  def getCacheLocs(rdd: RDD[_]): IndexedSeq[Seq[TaskLocation]] = cacheLocs.synchronized {
+  def getCacheLocs(rdd: RDD[_]): Option[IndexedSeq[Seq[TaskLocation]]] =
+    if(rdd.getStorageLevel == StorageLevel.NONE) {
+      None
+    } else
+    cacheLocs.synchronized {
     // Note: this doesn't use `getOrElse()` because this method is called O(num tasks) times
     if (!cacheLocs.contains(rdd.id)) {
       // Note: if the storage level is NONE, we don't need to get locations from block manager.
@@ -304,7 +308,7 @@ class DAGScheduler(
       }
       cacheLocs(rdd.id) = locs
     }
-    cacheLocs(rdd.id)
+    Some(cacheLocs(rdd.id))
   }
 
   private def clearCacheLocs(): Unit = cacheLocs.synchronized {
@@ -432,7 +436,11 @@ class DAGScheduler(
    */
   private[scheduler] def getShuffleDependencies(
       rdd: RDD[_]): HashSet[ShuffleDependency[_, _, _]] = {
+
+    if(rdd.isInstanceOf[DirectRDD[_]]) return HashSet.empty;
+
     val parents = new HashSet[ShuffleDependency[_, _, _]]
+
     val visited = new HashSet[RDD[_]]
     val waitingForVisit = new ArrayStack[RDD[_]]
     waitingForVisit.push(rdd)
@@ -452,6 +460,9 @@ class DAGScheduler(
   }
 
   private def getMissingParentStages(stage: Stage): List[Stage] = {
+
+    if(stage.parents.isEmpty) { return  List.empty }
+
     val missing = new HashSet[Stage]
     val visited = new HashSet[RDD[_]]
     // We are manually maintaining a stack here to prevent StackOverflowError
@@ -460,7 +471,7 @@ class DAGScheduler(
     def visit(rdd: RDD[_]) {
       if (!visited(rdd)) {
         visited += rdd
-        val rddHasUncachedPartitions = getCacheLocs(rdd).contains(Nil)
+        val rddHasUncachedPartitions = getCacheLocs(rdd).isEmpty
         if (rddHasUncachedPartitions) {
           for (dep <- rdd.dependencies) {
             dep match {
@@ -601,6 +612,8 @@ class DAGScheduler(
     assert(partitions.size > 0)
     val func2 = func.asInstanceOf[(TaskContext, Iterator[_]) => _]
     val waiter = new JobWaiter(this, jobId, partitions.size, resultHandler)
+    MeasureTime.end("DAG scheduler submit only-3", " just before event loop submit")
+    MeasureTime.start("DAG scheduler submit only-3.1")
     eventProcessLoop.post(JobSubmitted(
       jobId, rdd, func2, partitions.toArray, callSite, waiter,
       SerializationUtils.clone(properties)))
@@ -861,6 +874,7 @@ class DAGScheduler(
       listener: JobListener,
       properties: Properties) {
     var finalStage: ResultStage = null
+
     try {
       // New stage creation may throw an exception if, for example, jobs are run on a
       // HadoopRDD whose underlying HDFS files have been deleted.
@@ -888,6 +902,8 @@ class DAGScheduler(
     val stageInfos = stageIds.flatMap(id => stageIdToStage.get(id).map(_.latestInfo))
     listenerBus.post(
       SparkListenerJobStart(job.jobId, jobSubmissionTime, stageInfos, properties))
+    MeasureTime.end("DAG scheduler submit only-4", "created job and stage, before submitStage")
+    MeasureTime.start("DAG scheduler submit only-5")
     submitStage(finalStage)
   }
 
@@ -963,6 +979,26 @@ class DAGScheduler(
 
     // First figure out the indexes of partition ids to compute.
     val partitionsToCompute: Seq[Int] = stage.findMissingPartitions()
+    if (partitionsToCompute.isEmpty) {
+      // Because we posted SparkListenerStageSubmitted earlier, we should mark
+      // the stage as completed here in case there are no tasks to run
+      markStageAsFinished(stage, None)
+
+      val debugString = stage match {
+        case stage: ShuffleMapStage =>
+          s"Stage ${stage} is actually done; " +
+            s"(available: ${stage.isAvailable}," +
+            s"available outputs: ${stage.numAvailableOutputs}," +
+            s"partitions: ${stage.numPartitions})"
+        case stage : ResultStage =>
+          s"Stage ${stage} is actually done; (partitions: ${stage.numPartitions})"
+      }
+      logDebug(debugString)
+
+      submitWaitingChildStages(stage)
+      return
+    }
+
 
     // Use the scheduling pool, job group, description, etc. from an ActiveJob associated
     // with this Stage
@@ -1009,6 +1045,8 @@ class DAGScheduler(
     }
     listenerBus.post(SparkListenerStageSubmitted(stage.latestInfo, properties))
 
+    MeasureTime.end("DAG scheduler submit only-5", "before serialize stage & task")
+    MeasureTime.start("DAG scheduler submit only-6")
     // TODO: Maybe we can keep the taskBinary in Stage to avoid serializing it multiple times.
     // Broadcasted binary for the task, used to dispatch tasks to executors. Note that we broadcast
     // the serialized copy of the RDD and for each task we will deserialize it, which means each
@@ -1017,39 +1055,56 @@ class DAGScheduler(
     // where the JobConf/Configuration object is not thread-safe.
     var taskBinary: Broadcast[Array[Byte]] = null
     var partitions: Array[Partition] = null
-    try {
-      // For ShuffleMapTask, serialize and broadcast (rdd, shuffleDep).
-      // For ResultTask, serialize and broadcast (rdd, func).
-      var taskBinaryBytes: Array[Byte] = null
-      // taskBinaryBytes and partitions are both effected by the checkpoint status. We need
-      // this synchronization in case another concurrent job is checkpointing this RDD, so we get a
-      // consistent view of both variables.
-      RDDCheckpointData.synchronized {
-        taskBinaryBytes = stage match {
-          case stage: ShuffleMapStage =>
-            JavaUtils.bufferToArray(
-              closureSerializer.serialize((stage.rdd, stage.shuffleDep): AnyRef))
-          case stage: ResultStage =>
-            JavaUtils.bufferToArray(closureSerializer.serialize((stage.rdd, stage.func): AnyRef))
-        }
+    var dummyBroadcastValue: Broadcast[Array[Byte]] = null
+    if(stage.rdd.isInstanceOf[DirectOneRDD[_]]) {
+      partitions = stage.rdd.partitions
+      val rddSerialized = JavaUtils.bufferToArray(
+        closureSerializer.serialize(stage.rdd: AnyRef)
+      )
+      dummyBroadcastValue = new DummyBroadCast(rddSerialized)
+    } else
+      try {
+        // For ShuffleMapTask, serialize and broadcast (rdd, shuffleDep).
+        // For ResultTask, serialize and broadcast (rdd, func).
+        var taskBinaryBytes: Array[Byte] = null
+        // taskBinaryBytes and partitions are both effected by the checkpoint status. We need
+        // this synchronization in case another concurrent job is checkpointing this RDD, so we get a
 
-        partitions = stage.rdd.partitions
+        // consistent view of both variables.
+        RDDCheckpointData.synchronized {
+          taskBinaryBytes = stage match {
+            case stage: ShuffleMapStage =>
+              JavaUtils.bufferToArray(
+                closureSerializer.serialize((stage.rdd, stage.shuffleDep): AnyRef)
+              )
+            case stage: ResultStage =>
+              JavaUtils.bufferToArray(closureSerializer.serialize((stage.rdd, stage.func): AnyRef))
+          }
+
+          partitions = stage.rdd.partitions
+        }
+        MeasureTime.start("DAG scheduler submit only-6.1")
+        taskBinary = sc.broadcast(taskBinaryBytes)
+        MeasureTime
+          .end("DAG scheduler submit only-6.1",
+            "only Broadcast time of size (bytes)" + taskBinaryBytes.length
+          )
+      } catch {
+        // In the case of a failure during serialization, abort the stage.
+        case e: NotSerializableException =>
+          abortStage(stage, "Task not serializable: " + e.toString, Some(e))
+          runningStages -= stage
+
+          // Abort execution
+          return
+        case NonFatal(e) =>
+          abortStage(stage, s"Task serialization failed: $e\n${Utils.exceptionString(e)}", Some(e))
+          runningStages -= stage
+          return
       }
 
-      taskBinary = sc.broadcast(taskBinaryBytes)
-    } catch {
-      // In the case of a failure during serialization, abort the stage.
-      case e: NotSerializableException =>
-        abortStage(stage, "Task not serializable: " + e.toString, Some(e))
-        runningStages -= stage
-
-        // Abort execution
-        return
-      case NonFatal(e) =>
-        abortStage(stage, s"Task serialization failed: $e\n${Utils.exceptionString(e)}", Some(e))
-        runningStages -= stage
-        return
-    }
+    MeasureTime.end("DAG scheduler submit only-6", "Serialize and broad cast of rdd")
+    MeasureTime.start("DAG scheduler submit only-n")
 
     val tasks: Seq[Task[_]] = try {
       val serializedTaskMetrics = closureSerializer.serialize(stage.latestInfo.taskMetrics).array()
@@ -1070,9 +1125,15 @@ class DAGScheduler(
             val p: Int = stage.partitions(id)
             val part = partitions(p)
             val locs = taskIdToLocations(id)
-            new ResultTask(stage.id, stage.latestInfo.attemptNumber,
-              taskBinary, part, locs, id, properties, serializedTaskMetrics,
-              Option(jobId), Option(sc.applicationId), sc.applicationAttemptId)
+            if(dummyBroadcastValue != null) {
+              new ResultTask(stage.id, stage.latestInfo.attemptNumber,
+                dummyBroadcastValue, part, locs, id, properties, serializedTaskMetrics,
+                Option(jobId), Option(sc.applicationId), sc.applicationAttemptId)
+            } else {
+              new ResultTask(stage.id, stage.latestInfo.attemptNumber,
+                taskBinary, part, locs, id, properties, serializedTaskMetrics,
+                Option(jobId), Option(sc.applicationId), sc.applicationAttemptId)
+            }
           }
       }
     } catch {
@@ -1081,6 +1142,8 @@ class DAGScheduler(
         runningStages -= stage
         return
     }
+    MeasureTime.end("DAG scheduler submit only-n", "remaining")
+    MeasureTime.end("DAG scheduler submit only")
 
     if (tasks.size > 0) {
       logInfo(s"Submitting ${tasks.size} missing tasks from $stage (${stage.rdd}) (first 15 " +
@@ -1088,22 +1151,7 @@ class DAGScheduler(
       taskScheduler.submitTasks(new TaskSet(
         tasks.toArray, stage.id, stage.latestInfo.attemptNumber, jobId, properties))
     } else {
-      // Because we posted SparkListenerStageSubmitted earlier, we should mark
-      // the stage as completed here in case there are no tasks to run
-      markStageAsFinished(stage, None)
-
-      val debugString = stage match {
-        case stage: ShuffleMapStage =>
-          s"Stage ${stage} is actually done; " +
-            s"(available: ${stage.isAvailable}," +
-            s"available outputs: ${stage.numAvailableOutputs}," +
-            s"partitions: ${stage.numPartitions})"
-        case stage : ResultStage =>
-          s"Stage ${stage} is actually done; (partitions: ${stage.numPartitions})"
-      }
-      logDebug(debugString)
-
-      submitWaitingChildStages(stage)
+        // this case should never come as pending partition check already added earlier
     }
   }
 
@@ -1707,9 +1755,9 @@ class DAGScheduler(
       return Nil
     }
     // If the partition is cached, return the cache locations
-    val cached = getCacheLocs(rdd)(partition)
-    if (cached.nonEmpty) {
-      return cached
+    val cached = getCacheLocs(rdd).map(_(partition))
+    if (cached.isDefined) {
+      return cached.get
     }
     // If the RDD has some placement preferences (as is the case for input RDDs), get those
     val rddPrefs = rdd.preferredLocations(rdd.partitions(partition)).toList
@@ -1774,6 +1822,8 @@ private[scheduler] class DAGSchedulerEventProcessLoop(dagScheduler: DAGScheduler
 
   private def doOnReceive(event: DAGSchedulerEvent): Unit = event match {
     case JobSubmitted(jobId, rdd, func, partitions, callSite, listener, properties) =>
+      MeasureTime.end("DAG scheduler submit only-3.1", "received JobSubmitted in event loop")
+      MeasureTime.start("DAG scheduler submit only-4")
       dagScheduler.handleJobSubmitted(jobId, rdd, func, partitions, callSite, listener, properties)
 
     case MapStageSubmitted(jobId, dependency, callSite, listener, properties) =>
